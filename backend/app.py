@@ -160,6 +160,69 @@ async def websocket_endpoint(websocket: WebSocket):
 # --------------------------------------------------
 # Helpers
 # --------------------------------------------------
+
+async def train_model_background(category: str):
+    """Background task for model training with WebSocket updates"""
+    try:
+        await manager.broadcast({
+            "status": "training_started",
+            "category": category,
+            "message": f"Training started for {category}"
+        })
+
+        # Create a new session for the background task
+        async with AsyncSessionLocal() as session:
+            ts = await monthly_series(session, category)
+
+            if ts.empty:
+                await manager.broadcast({
+                    "status": "training_failed",
+                    "category": category,
+                    "error": "No data available for training"
+                })
+                return
+
+            if len(ts) < 6:
+                await manager.broadcast({
+                    "status": "training_failed",
+                    "category": category,
+                    "error": "Not enough data (need >=6 months)"
+                })
+                return
+
+            # Ensure no timezone information remains
+            ts['ds'] = pd.to_datetime(ts['ds']).dt.tz_localize(None)
+
+            # Drop any NaN values
+            ts = ts.dropna()
+
+            m = Prophet(
+                yearly_seasonality=True,
+                weekly_seasonality=False,
+                daily_seasonality=False,
+                uncertainty_samples=100
+            )
+            m.fit(ts)
+
+            p = model_path_for(category)
+            joblib.dump(m, p)
+
+            await manager.broadcast({
+                "status": "training_completed",
+                "category": category,
+                "months_trained": len(ts),
+                "message": f"Training completed for {category} with {len(ts)} months of data"
+            })
+
+    except Exception as e:
+        logger.error(f"Background training failed: {e}")
+        await manager.broadcast({
+            "status": "training_failed",
+            "category": category,
+            "error": str(e),
+            "message": f"Training failed for {category}: {str(e)}"
+        })
+
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -233,11 +296,6 @@ async def payment_methods(session: AsyncSession = Depends(get_session)):
     stmt = select(Sale.payment_method, func.count()).group_by(Sale.payment_method)
     res = await session.execute(stmt)
     return [{"Payment_method": r[0], "Count": int(r[1])} for r in res.all()]
-
-# --------------------------------------------------
-# Health
-# --------------------------------------------------
-
 
 
 @app.get("/timeseries")
