@@ -11,8 +11,7 @@ class Base(DeclarativeBase):
     pass
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://postgres:Priyanshu123@localhost:5432/ecom"
+    "DATABASE_URL"
 )
 
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
