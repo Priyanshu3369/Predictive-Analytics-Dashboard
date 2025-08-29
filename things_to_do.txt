@@ -1,0 +1,1 @@
+SECOND - make sure that websocket working properly so if we change anything in the database it'll reflect on the website withouth refreshing the website or restarting the server
