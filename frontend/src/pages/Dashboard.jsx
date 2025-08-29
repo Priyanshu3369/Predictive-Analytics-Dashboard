@@ -230,7 +230,7 @@
 
 
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import axios from "axios";
 import SalesByCategoryBar from "../components/SalesByCategoryBar";
 import SalesByGenderPie from "../components/SalesByGenderPie";
@@ -247,19 +247,11 @@ export default function Dashboard() {
   const [loadingForecast, setLoadingForecast] = useState(false);
   const [forecastError, setForecastError] = useState(null);
   const [loadingSummary, setLoadingSummary] = useState(true);
+  const [wsMessage, setWsMessage] = useState(null);
+  const [ws, setWs] = useState(null);
 
-  // ---------------- REST API ---------------- //
-  useEffect(() => {
-    setLoadingSummary(true);
-    Promise.all([
-      axios.get("http://127.0.0.1:8000/summary").then(r => setSummary(r.data)),
-      axios.get("http://127.0.0.1:8000/timeseries").then(r => setTimeseries(r.data))
-    ]).catch(console.error).finally(() => setLoadingSummary(false));
-
-    fetchForecast(category, horizon);
-  }, []);
-
-  const fetchForecast = async (cat, hor) => {
+  // ---------------- FETCH FORECAST ---------------- //
+  const fetchForecast = useCallback(async (cat, hor) => {
     try {
       setLoadingForecast(true);
       setForecastError(null);
@@ -272,16 +264,105 @@ export default function Dashboard() {
     } finally {
       setLoadingForecast(false);
     }
-  };
+  }, []);
 
-  const handleAfterTrain = () => {
+  const handleAfterTrain = useCallback(() => {
     fetchForecast(category, horizon);
-  };
+  }, [category, horizon, fetchForecast]);
 
+  // ---------------- REST API ---------------- //
   useEffect(() => {
+    setLoadingSummary(true);
+    Promise.all([
+      axios.get("http://127.0.0.1:8000/summary").then(r => setSummary(r.data)),
+      axios.get("http://127.0.0.1:8000/timeseries").then(r => setTimeseries(r.data))
+    ]).catch(console.error).finally(() => setLoadingSummary(false));
+
     fetchForecast(category, horizon);
-  }, [category, horizon]);
-  
+  }, [fetchForecast, category, horizon]);
+
+  // ---------------- WEBSOCKET ---------------- //
+  // In Dashboard.jsx, update the WebSocket useEffect
+  useEffect(() => {
+    let websocket = null;
+    let reconnectTimeout = null;
+
+    const connectWebSocket = () => {
+      try {
+        websocket = new WebSocket("ws://127.0.0.1:8000/ws");
+
+        websocket.onopen = () => {
+          console.log("✅ WebSocket connected");
+          setWs(websocket);
+          websocket.send(JSON.stringify({ type: "subscribe", category: category }));
+        };
+
+        websocket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            console.log("📩 WS Received:", data);
+
+            // Handle different message types
+            if (data.status === "training_started") {
+              setWsMessage({
+                type: "info",
+                message: `Training started for ${data.category}`
+              });
+            } else if (data.status === "training_completed") {
+              setWsMessage({
+                type: "success",
+                message: `Training completed for ${data.category} (${data.months_trained} months)`
+              });
+              fetchForecast(category, horizon);
+            } else if (data.status === "training_failed") {
+              setWsMessage({
+                type: "error",
+                message: `Training failed for ${data.category}: ${data.error}`
+              });
+            }
+
+            setTimeout(() => {
+              setWsMessage(null);
+            }, 5000);
+          } catch (error) {
+            console.error("Error parsing WebSocket message:", error);
+          }
+        };
+
+        websocket.onclose = (event) => {
+          console.log("❌ WebSocket disconnected", event.code, event.reason);
+          setWs(null);
+
+          // Only reconnect if it wasn't a normal closure
+          if (event.code !== 1000) {
+            reconnectTimeout = setTimeout(() => {
+              console.log("🔄 Attempting to reconnect WebSocket...");
+              connectWebSocket();
+            }, 3000);
+          }
+        };
+
+        websocket.onerror = (error) => {
+          console.error("WebSocket error:", error);
+        };
+
+      } catch (error) {
+        console.error("Failed to create WebSocket:", error);
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+      }
+      if (websocket) {
+        websocket.close(1000, "Component unmounting");
+      }
+    };
+  }, [category, horizon, fetchForecast]);
+
   // ---------------- FORMATTERS ---------------- //
   const formatCurrency = (value) => {
     if (value == null) return "—";
@@ -343,6 +424,48 @@ export default function Dashboard() {
           </h1>
           <p className="text-gray-600">Monitor your business performance and forecast future trends</p>
         </div>
+
+        {/* WebSocket Notification */}
+        {wsMessage && (
+          <div className={`mb-6 p-4 rounded-lg border shadow-sm ${wsMessage.type === "error"
+              ? "bg-red-100 border-red-300 text-red-800"
+              : wsMessage.type === "success"
+                ? "bg-green-100 border-green-300 text-green-800"
+                : "bg-blue-100 border-blue-300 text-blue-800"
+            }`}>
+            <div className="flex items-center">
+              <span className="mr-2 text-lg">
+                {wsMessage.type === "error" ? "❌" :
+                  wsMessage.type === "success" ? "✅" : "ℹ️"}
+              </span>
+              <div>
+                <strong className="block text-sm font-medium">
+                  {wsMessage.type === "error" ? "Error" :
+                    wsMessage.type === "success" ? "Success" : "Info"}
+                </strong>
+                <span className="text-sm">{wsMessage.message}</span>
+              </div>
+              <button
+                onClick={() => setWsMessage(null)}
+                className="ml-auto text-gray-500 hover:text-gray-700"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Test WebSocket Button (optional) */}
+        <button
+          onClick={() => {
+            if (ws) {
+              ws.send(JSON.stringify({ type: "test", message: "Hello WebSocket!" }));
+            }
+          }}
+          className="mb-4 px-4 py-2 bg-blue-500 text-white rounded"
+        >
+          Test WebSocket
+        </button>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <SummaryCard

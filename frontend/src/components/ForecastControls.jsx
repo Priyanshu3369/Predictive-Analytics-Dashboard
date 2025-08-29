@@ -22,14 +22,25 @@ export default function ForecastControls({ category, setCategory, horizon, setHo
 
   const handleTrain = async () => {
     try {
-      setTrainStatus({ loading: true, message: "Training model…" });
-      const resp = await axios.post(`http://127.0.0.1:8000/train_forecast?category=${encodeURIComponent(category)}`);
-      setTrainStatus({ loading: false, message: `Trained — ${resp.data.months_trained} months` });
+      setTrainStatus({ loading: true, message: "Training model… WebSocket updates will appear above." });
+      const resp = await axios.post(
+        `http://127.0.0.1:8000/train_forecast?category=${encodeURIComponent(category)}`
+      );
+
+      // The actual status will come via WebSocket, but we can show immediate feedback
+      setTrainStatus({
+        loading: false,
+        message: `Training queued for ${category}. Watch for WebSocket updates.`
+      });
+
       if (onTrain) onTrain();
       setTimeout(() => setTrainStatus({ loading: false, message: "" }), 3000);
     } catch (err) {
       console.error(err);
-      setTrainStatus({ loading: false, message: `Train failed: ${err?.response?.data?.detail || err.message}` });
+      setTrainStatus({
+        loading: false,
+        message: `Train failed: ${err?.response?.data?.detail || err.message}`
+      });
     }
   };
 
@@ -78,11 +89,10 @@ export default function ForecastControls({ category, setCategory, horizon, setHo
       </div>
 
       {trainStatus.message && (
-        <div className={`mt-4 p-3 rounded-lg text-sm ${
-          trainStatus.message.includes('failed') || trainStatus.message.includes('Train failed') 
-            ? 'bg-red-50 text-red-700 border border-red-200' 
+        <div className={`mt-4 p-3 rounded-lg text-sm ${trainStatus.message.includes('failed') || trainStatus.message.includes('Train failed')
+            ? 'bg-red-50 text-red-700 border border-red-200'
             : 'bg-green-50 text-green-700 border border-green-200'
-        }`}>
+          }`}>
           {trainStatus.message}
         </div>
       )}
