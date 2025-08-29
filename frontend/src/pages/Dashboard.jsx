@@ -219,18 +219,6 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Test WebSocket Button (optional) */}
-        <button
-          onClick={() => {
-            if (ws) {
-              ws.send(JSON.stringify({ type: "test", message: "Hello WebSocket!" }));
-            }
-          }}
-          className="mb-4 px-4 py-2 bg-blue-500 text-white rounded"
-        >
-          Test WebSocket
-        </button>
-
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <SummaryCard
             title="Total Sales"
