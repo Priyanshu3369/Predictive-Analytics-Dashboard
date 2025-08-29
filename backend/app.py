@@ -1,13 +1,37 @@
-from fastapi import WebSocket, WebSocketDisconnect
-from typing import List, Dict, Any, Optional
+import os
+import json
 import logging
 import asyncio
+import asyncpg
+import pandas as pd
+import numpy as np
+import joblib
+from typing import List, Optional
+from contextlib import asynccontextmanager
+from datetime import date, time as dtime
 
-# Add logging configuration
+from fastapi import (
+    FastAPI, WebSocket, WebSocketDisconnect,
+    HTTPException, Query, BackgroundTasks, Depends, Path
+)
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from prophet import Prophet  # type: ignore
+from pydantic import BaseModel
+
+from database import AsyncSessionLocal, get_session
+from models import Sale
+
+# --------------------------------------------------
+# Logging setup
+# --------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- WEBSOCKET MANAGER ---------------- #
+# --------------------------------------------------
+# WebSocket Manager
+# --------------------------------------------------
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -15,19 +39,12 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        logger.info(f"New WebSocket connection. Total connections: {len(self.active_connections)}")
+        logger.info(f"✅ New WebSocket connected. Total: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-            logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
-
-    async def send_personal_message(self, message: dict, websocket: WebSocket):
-        try:
-            await websocket.send_json(message)
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            self.disconnect(websocket)
+            logger.info(f"❌ WebSocket disconnected. Total: {len(self.active_connections)}")
 
     async def broadcast(self, message: dict):
         disconnected = []
@@ -35,43 +52,22 @@ class ConnectionManager:
             try:
                 await connection.send_json(message)
             except Exception as e:
-                logger.error(f"Error broadcasting: {e}")
+                logger.error(f"Broadcast error: {e}")
                 disconnected.append(connection)
         for conn in disconnected:
             self.disconnect(conn)
 
-# Create global manager instance
 manager = ConnectionManager()
 
-# ---------------- DATA UPDATE BROADCAST ---------------- #
 async def broadcast_data_update():
-    """Broadcast message to notify all clients that data changed"""
     await manager.broadcast({
         "type": "data_updated",
         "message": "Database data updated. Refreshing dashboard data..."
     })
 
-# ---------------- WEBSOCKET ENDPOINT ---------------- #
-
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends, Path
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-import pandas as pd
-import numpy as np
-import os
-import json
-from typing import List
-from prophet import Prophet  # type: ignore
-import joblib
-from database import AsyncSessionLocal
-from database import get_session
-from models import Sale
-
-# Pydantic models for write APIs
-from pydantic import BaseModel
-from datetime import date, time as dtime
-
+# --------------------------------------------------
+# Pydantic models
+# --------------------------------------------------
 class SaleCreate(BaseModel):
     order_date: date
     time: Optional[dtime] = None
@@ -110,95 +106,60 @@ class SaleUpdate(BaseModel):
     payment_method: Optional[str] = None
     sales_per_unit: Optional[float] = None
 
-app = FastAPI()
+# --------------------------------------------------
+# Lifespan (DB LISTEN/NOTIFY)
+# --------------------------------------------------
+async def notify_handler(conn, pid, channel, payload):
+    logger.info(f"🔔 DB Notification: {payload}")
+    asyncio.create_task(broadcast_data_update())
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    conn = await asyncpg.connect(
+        user="postgres",
+        password="Priyanshu123",
+        database="ecom",
+        host="localhost",
+        port=5432
+    )
+    await conn.add_listener("sales_changes", notify_handler)
+    logger.info("✅ Listening for Postgres NOTIFY events...")
+
+    yield
+
+    await conn.close()
+    logger.info("🛑 DB connection closed.")
+
+# --------------------------------------------------
+# App initialization
+# --------------------------------------------------
+app = FastAPI(lifespan=lifespan)
+
+# Enable CORS (for React frontend on localhost:5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
+# --------------------------------------------------
+# WebSocket endpoint
+# --------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive, listen for messages (optional: handle 'subscribe')
-            data = await websocket.receive_text()
-            logger.info(f"Received WebSocket message: {data}")
+            # Keep alive (ignore incoming)
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-        logger.info("WebSocket client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
 
-# ---------------- UPDATE TRAINING FUNCTION TO USE WEBSOCKET ---------------- #
-async def train_model_background(category: str):
-    """Background task for model training with WebSocket updates"""
-    try:
-        await manager.broadcast({
-            "status": "training_started",
-            "category": category,
-            "message": f"Training started for {category}"
-        })
-
-        # Create a new session for the background task
-        async with AsyncSessionLocal() as session:
-            ts = await monthly_series(session, category)
-
-            if ts.empty:
-                await manager.broadcast({
-                    "status": "training_failed",
-                    "category": category,
-                    "error": "No data available for training"
-                })
-                return
-
-            if len(ts) < 6:
-                await manager.broadcast({
-                    "status": "training_failed",
-                    "category": category,
-                    "error": "Not enough data (need >=6 months)"
-                })
-                return
-
-            # Ensure no timezone information remains
-            ts['ds'] = pd.to_datetime(ts['ds']).dt.tz_localize(None)
-
-            # Drop any NaN values
-            ts = ts.dropna()
-
-            m = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                uncertainty_samples=100
-            )
-            m.fit(ts)
-
-            p = model_path_for(category)
-            joblib.dump(m, p)
-
-            await manager.broadcast({
-                "status": "training_completed",
-                "category": category,
-                "months_trained": len(ts),
-                "message": f"Training completed for {category} with {len(ts)} months of data"
-            })
-
-    except Exception as e:
-        logger.error(f"Background training failed: {e}")
-        await manager.broadcast({
-            "status": "training_failed",
-            "category": category,
-            "error": str(e),
-            "message": f"Training failed for {category}: {str(e)}"
-        })
-
-
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -206,14 +167,12 @@ def model_path_for(category: str) -> str:
     safe = (category or "All").replace(" ", "_").replace("/", "_")
     return os.path.join(MODELS_DIR, f"prophet_sales_{safe}.pkl")
 
-# ---------------- HELPERS ---------------- #
 async def load_df(session: AsyncSession) -> pd.DataFrame:
     stmt = select(Sale)
     res = await session.execute(stmt)
     rows = res.scalars().all()
     if not rows:
         raise HTTPException(status_code=404, detail="No sales data found")
-
     df = pd.DataFrame([{
         "Order_Date": r.order_date,
         "Sales": r.sales,
@@ -229,33 +188,23 @@ async def load_df(session: AsyncSession) -> pd.DataFrame:
 async def monthly_series(session: AsyncSession, category: str | None):
     month = func.date_trunc("month", Sale.order_date).label("ds")
     stmt = select(month, func.sum(Sale.sales).label("y")).group_by(month).order_by(month)
-
     if category and category != "All":
         stmt = stmt.where(Sale.product_category == category)
-
     res = await session.execute(stmt)
     rows = res.all()
-
     if not rows:
         return pd.DataFrame(columns=["ds", "y"])
-
     df = pd.DataFrame(rows, columns=["ds", "y"])
-
-    # Remove timezone information from datetime column
     if not df.empty and hasattr(df['ds'], 'dt'):
-        df['ds'] = df['ds'].dt.tz_localize(None)  # Remove timezone info
-
+        df['ds'] = df['ds'].dt.tz_localize(None)
     return df
 
-# ---------------- ROUTES (READ) ---------------- #
+# --------------------------------------------------
+# Routes
+# --------------------------------------------------
 @app.get("/")
 def root():
     return {"message": "E-commerce Predictive Analytics API with PostgreSQL 🚀"}
-
-@app.get("/data")
-async def get_sample_data(session: AsyncSession = Depends(get_session)):
-    df = await load_df(session)
-    return df.head(10).to_dict(orient="records")
 
 @app.get("/summary")
 async def get_summary(session: AsyncSession = Depends(get_session)):
@@ -269,8 +218,7 @@ async def get_summary(session: AsyncSession = Depends(get_session)):
 
 @app.get("/sales_by_category")
 async def sales_by_category(session: AsyncSession = Depends(get_session)):
-    stmt = select(Sale.product_category, func.sum(Sale.sales)) \
-            .group_by(Sale.product_category)
+    stmt = select(Sale.product_category, func.sum(Sale.sales)).group_by(Sale.product_category)
     res = await session.execute(stmt)
     return [{"Product_Category": r[0], "Sales": float(r[1])} for r in res.all()]
 
@@ -285,6 +233,12 @@ async def payment_methods(session: AsyncSession = Depends(get_session)):
     stmt = select(Sale.payment_method, func.count()).group_by(Sale.payment_method)
     res = await session.execute(stmt)
     return [{"Payment_method": r[0], "Count": int(r[1])} for r in res.all()]
+
+# --------------------------------------------------
+# Health
+# --------------------------------------------------
+
+
 
 @app.get("/timeseries")
 async def get_timeseries(
@@ -429,7 +383,6 @@ async def predict(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "active_websocket_connections": len(manager.active_connections)
