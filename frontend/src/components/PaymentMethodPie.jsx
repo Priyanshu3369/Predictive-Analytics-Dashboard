@@ -10,7 +10,7 @@ export default function PaymentMethodPie() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
+  const fetchData = () => {
     setLoading(true);
     axios.get("http://127.0.0.1:8000/payment_methods")
       .then(res => {
@@ -19,6 +19,24 @@ export default function PaymentMethodPie() {
       })
       .catch(err => setError(err.message || "Failed to load"))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  // 🔥 Listen for live updates
+  useEffect(() => {
+    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "data_updated") {
+          fetchData();
+        }
+      } catch {}
+    };
+    return () => ws.close(1000, "unmount chart");
   }, []);
 
   if (loading) return <ChartCard title="Payment Method Distribution"><div className="flex items-center justify-center h-full">Loading…</div></ChartCard>;

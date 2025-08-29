@@ -18,7 +18,16 @@ export default function Dashboard() {
   const [wsMessage, setWsMessage] = useState(null);
   const [ws, setWs] = useState(null);
 
-  // ---------------- FETCH FORECAST ---------------- //
+  // ---------------- FETCHERS ---------------- //
+  const fetchSummary = useCallback(async () => {
+    const [s, t] = await Promise.all([
+      axios.get("http://127.0.0.1:8000/summary"),
+      axios.get("http://127.0.0.1:8000/timeseries")
+    ]);
+    setSummary(s.data);
+    setTimeseries(t.data);
+  }, []);
+
   const fetchForecast = useCallback(async (cat, hor) => {
     try {
       setLoadingForecast(true);
@@ -38,15 +47,16 @@ export default function Dashboard() {
     fetchForecast(category, horizon);
   }, [category, horizon, fetchForecast]);
 
+  // Initial load
   useEffect(() => {
     setLoadingSummary(true);
-    Promise.all([
-      axios.get("http://127.0.0.1:8000/summary").then(r => setSummary(r.data)),
-      axios.get("http://127.0.0.1:8000/timeseries").then(r => setTimeseries(r.data))
-    ]).catch(console.error).finally(() => setLoadingSummary(false));
-
+    fetchSummary()
+      .catch(console.error)
+      .finally(() => setLoadingSummary(false));
     fetchForecast(category, horizon);
-  }, [fetchForecast, category, horizon]);
+  }, [fetchSummary, fetchForecast, category, horizon]);
+
+  // WebSocket connection + handlers
   useEffect(() => {
     let websocket = null;
     let reconnectTimeout = null;
@@ -58,6 +68,7 @@ export default function Dashboard() {
         websocket.onopen = () => {
           console.log("✅ WebSocket connected");
           setWs(websocket);
+          // Optional: send a subscription; backend currently logs
           websocket.send(JSON.stringify({ type: "subscribe", category: category }));
         };
 
@@ -66,28 +77,25 @@ export default function Dashboard() {
             const data = JSON.parse(event.data);
             console.log("📩 WS Received:", data);
 
-            // Handle different message types
+            // Training messages (existing behavior)
             if (data.status === "training_started") {
-              setWsMessage({
-                type: "info",
-                message: `Training started for ${data.category}`
-              });
+              setWsMessage({ type: "info", message: `Training started for ${data.category}` });
             } else if (data.status === "training_completed") {
-              setWsMessage({
-                type: "success",
-                message: `Training completed for ${data.category} (${data.months_trained} months)`
-              });
+              setWsMessage({ type: "success", message: `Training completed for ${data.category} (${data.months_trained} months)` });
               fetchForecast(category, horizon);
             } else if (data.status === "training_failed") {
-              setWsMessage({
-                type: "error",
-                message: `Training failed for ${data.category}: ${data.error}`
-              });
+              setWsMessage({ type: "error", message: `Training failed for ${data.category}: ${data.error}` });
             }
 
-            setTimeout(() => {
-              setWsMessage(null);
-            }, 5000);
+            // 🔥 NEW: data change broadcast
+            if (data.type === "data_updated") {
+              setWsMessage({ type: "info", message: data.message || "Data updated" });
+              // Re-fetch only what Dashboard owns
+              fetchSummary().catch(console.error);
+              // Forecast can stay as-is; retrain is separate
+            }
+
+            setTimeout(() => setWsMessage(null), 5000);
           } catch (error) {
             console.error("Error parsing WebSocket message:", error);
           }
@@ -96,8 +104,6 @@ export default function Dashboard() {
         websocket.onclose = (event) => {
           console.log("❌ WebSocket disconnected", event.code, event.reason);
           setWs(null);
-
-          // Only reconnect if it wasn't a normal closure
           if (event.code !== 1000) {
             reconnectTimeout = setTimeout(() => {
               console.log("🔄 Attempting to reconnect WebSocket...");
@@ -118,14 +124,10 @@ export default function Dashboard() {
     connectWebSocket();
 
     return () => {
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-      }
-      if (websocket) {
-        websocket.close(1000, "Component unmounting");
-      }
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (websocket) websocket.close(1000, "Component unmounting");
     };
-  }, [category, horizon, fetchForecast]);
+  }, [category, horizon, fetchForecast, fetchSummary]);
 
   // ---------------- FORMATTERS ---------------- //
   const formatCurrency = (value) => {
@@ -148,7 +150,6 @@ export default function Dashboard() {
     return `${(value * 100).toFixed(1)}%`;
   };
 
-  // ---------------- UI COMPONENT ---------------- //
   const SummaryCard = ({ title, value, icon, color = "blue" }) => {
     const colorClasses = {
       blue: "bg-blue-50 text-blue-600 border-blue-200",
@@ -178,7 +179,6 @@ export default function Dashboard() {
     );
   };
 
-  // ---------------- RENDER ---------------- //
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
       <div className="p-6">
@@ -191,21 +191,22 @@ export default function Dashboard() {
 
         {/* WebSocket Notification */}
         {wsMessage && (
-          <div className={`mb-6 p-4 rounded-lg border shadow-sm ${wsMessage.type === "error"
+          <div className={`mb-6 p-4 rounded-lg border shadow-sm ${
+            wsMessage.type === "error"
               ? "bg-red-100 border-red-300 text-red-800"
               : wsMessage.type === "success"
                 ? "bg-green-100 border-green-300 text-green-800"
                 : "bg-blue-100 border-blue-300 text-blue-800"
-            }`}>
+          }`}>
             <div className="flex items-center">
               <span className="mr-2 text-lg">
                 {wsMessage.type === "error" ? "❌" :
-                  wsMessage.type === "success" ? "✅" : "ℹ️"}
+                 wsMessage.type === "success" ? "✅" : "ℹ️"}
               </span>
               <div>
                 <strong className="block text-sm font-medium">
                   {wsMessage.type === "error" ? "Error" :
-                    wsMessage.type === "success" ? "Success" : "Info"}
+                   wsMessage.type === "success" ? "Success" : "Info"}
                 </strong>
                 <span className="text-sm">{wsMessage.message}</span>
               </div>
@@ -220,30 +221,10 @@ export default function Dashboard() {
         )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-          <SummaryCard
-            title="Total Sales"
-            value={formatCurrency(summary.total_sales)}
-            icon="💰"
-            color="green"
-          />
-          <SummaryCard
-            title="Total Profit"
-            value={formatCurrency(summary.total_profit)}
-            icon="📈"
-            color="blue"
-          />
-          <SummaryCard
-            title="Total Orders"
-            value={formatNumber(summary.total_orders)}
-            icon="📦"
-            color="purple"
-          />
-          <SummaryCard
-            title="Avg Discount"
-            value={formatPercent(summary.avg_discount)}
-            icon="🏷️"
-            color="orange"
-          />
+          <SummaryCard title="Total Sales" value={formatCurrency(summary.total_sales)} icon="💰" color="green" />
+          <SummaryCard title="Total Profit" value={formatCurrency(summary.total_profit)} icon="📈" color="blue" />
+          <SummaryCard title="Total Orders" value={formatNumber(summary.total_orders)} icon="📦" color="purple" />
+          <SummaryCard title="Avg Discount" value={formatPercent(summary.avg_discount)} icon="🏷️" color="orange" />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">

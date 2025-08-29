@@ -8,7 +8,7 @@ export default function SalesByCategoryBar() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
+  const fetchData = () => {
     setLoading(true);
     axios.get("http://127.0.0.1:8000/sales_by_category")
       .then(res => {
@@ -17,6 +17,24 @@ export default function SalesByCategoryBar() {
       })
       .catch(err => setError(err.message || "Failed to load"))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  // 🔥 Listen for live updates
+  useEffect(() => {
+    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "data_updated") {
+          fetchData();
+        }
+      } catch { }
+    };
+    return () => ws.close(1000, "unmount chart");
   }, []);
 
   if (loading) {
@@ -45,27 +63,27 @@ export default function SalesByCategoryBar() {
   return (
     <ChartCard title="Sales by Product Category">
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart 
-          data={data} 
+        <BarChart
+          data={data}
           margin={{ top: 20, right: 30, left: 20, bottom: 60 }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-          <XAxis 
-            dataKey="Product_Category" 
-            angle={-45} 
-            textAnchor="end" 
-            interval={0} 
+          <XAxis
+            dataKey="Product_Category"
+            angle={-45}
+            textAnchor="end"
+            interval={0}
             height={80}
             tick={{ fontSize: 11, fill: "#6b7280" }}
             axisLine={{ stroke: "#d1d5db" }}
             tickLine={{ stroke: "#d1d5db" }}
           />
-          <YAxis 
+          <YAxis
             tick={{ fontSize: 12, fill: "#6b7280" }}
             axisLine={{ stroke: "#d1d5db" }}
             tickLine={{ stroke: "#d1d5db" }}
           />
-          <Tooltip 
+          <Tooltip
             formatter={(value) => [value.toLocaleString(), "Sales"]}
             contentStyle={{
               backgroundColor: "#ffffff",
@@ -73,11 +91,12 @@ export default function SalesByCategoryBar() {
               borderRadius: "8px",
               boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)"
             }}
+
           />
           <Legend wrapperStyle={{ paddingTop: "20px" }} />
-          <Bar 
-            dataKey="Sales" 
-            name="Sales" 
+          <Bar
+            dataKey="Sales"
+            name="Sales"
             fill="#3B82F6"
             radius={[4, 4, 0, 0]}
             maxBarSize={60}
