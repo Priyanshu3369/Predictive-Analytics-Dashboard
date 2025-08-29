@@ -55,7 +55,7 @@ import os
 import json
 import asyncio
 from typing import List
-from prophet import Prophet
+from prophet import Prophet #type:ignore
 import joblib
 from database import AsyncSessionLocal
 from database import get_session
