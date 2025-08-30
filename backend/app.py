@@ -6,6 +6,7 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import joblib
+import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from datetime import date, time as dtime
@@ -66,6 +67,35 @@ async def broadcast_data_update():
     })
 
 # --------------------------------------------------
+# Simple In-Memory Cache
+# --------------------------------------------------
+CACHE_TTL = 60  # seconds
+_cache = {}
+
+def set_cache(key, value):
+    _cache[key] = (value, time.time())
+
+def get_cache(key):
+    if key in _cache:
+        value, ts = _cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return value
+    return None
+
+def clear_cache(prefix: Optional[str] = None):
+    """Clear entire cache or only keys with given prefix."""
+    if prefix is None:
+        _cache.clear()
+        logger.info("🧹 Cache cleared (all keys).")
+        return
+    removed = 0
+    for k in list(_cache.keys()):
+        if k.startswith(prefix):
+            _cache.pop(k, None)
+            removed += 1
+    logger.info(f"🧹 Cache cleared for prefix '{prefix}' (removed {removed} keys).")
+
+# --------------------------------------------------
 # Pydantic models
 # --------------------------------------------------
 class SaleCreate(BaseModel):
@@ -111,6 +141,7 @@ class SaleUpdate(BaseModel):
 # --------------------------------------------------
 async def notify_handler(conn, pid, channel, payload):
     logger.info(f"🔔 DB Notification: {payload}")
+    clear_cache(prefix="dashboard:")
     asyncio.create_task(broadcast_data_update())
 
 @asynccontextmanager
@@ -135,7 +166,6 @@ async def lifespan(app: FastAPI):
 # --------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
-# Enable CORS (for React frontend on localhost:5173)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
@@ -152,7 +182,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep alive (ignore incoming)
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -160,69 +189,6 @@ async def websocket_endpoint(websocket: WebSocket):
 # --------------------------------------------------
 # Helpers
 # --------------------------------------------------
-
-async def train_model_background(category: str):
-    """Background task for model training with WebSocket updates"""
-    try:
-        await manager.broadcast({
-            "status": "training_started",
-            "category": category,
-            "message": f"Training started for {category}"
-        })
-
-        # Create a new session for the background task
-        async with AsyncSessionLocal() as session:
-            ts = await monthly_series(session, category)
-
-            if ts.empty:
-                await manager.broadcast({
-                    "status": "training_failed",
-                    "category": category,
-                    "error": "No data available for training"
-                })
-                return
-
-            if len(ts) < 6:
-                await manager.broadcast({
-                    "status": "training_failed",
-                    "category": category,
-                    "error": "Not enough data (need >=6 months)"
-                })
-                return
-
-            # Ensure no timezone information remains
-            ts['ds'] = pd.to_datetime(ts['ds']).dt.tz_localize(None)
-
-            # Drop any NaN values
-            ts = ts.dropna()
-
-            m = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                uncertainty_samples=100
-            )
-            m.fit(ts)
-
-            p = model_path_for(category)
-            joblib.dump(m, p)
-
-            await manager.broadcast({
-                "status": "training_completed",
-                "category": category,
-                "months_trained": len(ts),
-                "message": f"Training completed for {category} with {len(ts)} months of data"
-            })
-
-    except Exception as e:
-        logger.error(f"Background training failed: {e}")
-        await manager.broadcast({
-            "status": "training_failed",
-            "category": category,
-            "error": str(e),
-            "message": f"Training failed for {category}: {str(e)}"
-        })
-
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -269,73 +235,65 @@ async def monthly_series(session: AsyncSession, category: str | None):
 def root():
     return {"message": "E-commerce Predictive Analytics API with PostgreSQL 🚀"}
 
-@app.get("/summary")
-async def get_summary(session: AsyncSession = Depends(get_session)):
+@app.get("/categories")
+async def get_categories(session: AsyncSession = Depends(get_session)):
+    stmt = select(Sale.product_category).distinct()
+    res = await session.execute(stmt)
+    categories = [row[0] for row in res.all()]
+    return {"categories": ["All"] + categories}
+
+@app.get("/dashboard_data")
+async def get_dashboard_data(
+    category: str = Query("All"),
+    session: AsyncSession = Depends(get_session)
+):
+    cached = get_cache(f"dashboard:{category}")
+    if cached:
+        return cached
+
     df = await load_df(session)
-    return {
+
+    summary = {
         "total_sales": float(df["Sales"].sum().round(2)),
         "total_profit": float(df["Profit"].sum().round(2)),
         "total_orders": int(df.shape[0]),
         "avg_discount": float(df["Discount"].mean().round(2)),
     }
 
-@app.get("/sales_by_category")
-async def sales_by_category(session: AsyncSession = Depends(get_session)):
-    stmt = select(Sale.product_category, func.sum(Sale.sales)).group_by(Sale.product_category)
-    res = await session.execute(stmt)
-    return [{"Product_Category": r[0], "Sales": float(r[1])} for r in res.all()]
+    sales_by_cat = (
+        df.groupby("Product_Category")["Sales"].sum().reset_index().to_dict(orient="records")
+    )
+    sales_by_gen = (
+        df.groupby("Gender")["Sales"].sum().reset_index().to_dict(orient="records")
+    )
+    payment_methods = (
+        df.groupby("Payment_method")["Sales"].count().reset_index()
+        .rename(columns={"Sales": "Count"})
+        .to_dict(orient="records")
+    )
+    ts = await monthly_series(session, category)
+    ts["ds"] = ts["ds"].dt.strftime("%Y-%m-%d")
+    timeseries = ts.to_dict(orient="records")
 
-@app.get("/sales_by_gender")
-async def sales_by_gender(session: AsyncSession = Depends(get_session)):
-    stmt = select(Sale.gender, func.sum(Sale.sales)).group_by(Sale.gender)
-    res = await session.execute(stmt)
-    return [{"Gender": r[0], "Sales": float(r[1])} for r in res.all()]
+    data = {
+        "summary": summary,
+        "sales_by_category": sales_by_cat,
+        "sales_by_gender": sales_by_gen,
+        "payment_methods": payment_methods,
+        "timeseries": {"category": category, "data": timeseries}
+    }
 
-@app.get("/payment_methods")
-async def payment_methods(session: AsyncSession = Depends(get_session)):
-    stmt = select(Sale.payment_method, func.count()).group_by(Sale.payment_method)
-    res = await session.execute(stmt)
-    return [{"Payment_method": r[0], "Count": int(r[1])} for r in res.all()]
-
-
-@app.get("/timeseries")
-async def get_timeseries(
-    category: str = Query("All"),
-    session: AsyncSession = Depends(get_session)
-):
-    """Get time series data for sales over time"""
-    try:
-        ts = await monthly_series(session, category)
-        if ts.empty:
-            raise HTTPException(status_code=404, detail="No data for requested category")
-
-        # Convert to the format expected by the frontend
-        ts["ds"] = pd.to_datetime(ts["ds"])
-        ts["ds"] = ts["ds"].dt.strftime("%Y-%m-%d")
-
-        return {
-            "category": category,
-            "data": ts.to_dict(orient="records")
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching timeseries data: {str(e)}")
-
-@app.get("/categories")
-async def get_categories(session: AsyncSession = Depends(get_session)):
-    """Get all available product categories"""
-    stmt = select(Sale.product_category).distinct()
-    res = await session.execute(stmt)
-    categories = [row[0] for row in res.all()]
-    return {"categories": ["All"] + categories}
+    set_cache(f"dashboard:{category}", data)
+    return data
 
 # ---------------- ROUTES (WRITE) ---------------- #
 @app.post("/sales", status_code=201)
 async def create_sale(payload: SaleCreate, session: AsyncSession = Depends(get_session)):
-    """Create a new sale row and broadcast update."""
     sale = Sale(**payload.dict())
     session.add(sale)
     await session.commit()
     await session.refresh(sale)
+    clear_cache(prefix="dashboard:")
     await broadcast_data_update()
     return {"status": "ok", "id": sale.id}
 
@@ -345,27 +303,25 @@ async def update_sale(
     payload: SaleUpdate = None,
     session: AsyncSession = Depends(get_session)
 ):
-    """Update a sale row by id and broadcast update."""
     sale = await session.get(Sale, sale_id)
     if not sale:
         raise HTTPException(status_code=404, detail="Sale not found")
-
     data = payload.dict(exclude_unset=True)
     for k, v in data.items():
         setattr(sale, k, v)
-
     await session.commit()
+    clear_cache(prefix="dashboard:")
     await broadcast_data_update()
     return {"status": "ok", "id": sale_id}
 
 @app.delete("/sales/{sale_id}")
 async def delete_sale(sale_id: int, session: AsyncSession = Depends(get_session)):
-    """Delete a sale row by id and broadcast update."""
     sale = await session.get(Sale, sale_id)
     if not sale:
         raise HTTPException(status_code=404, detail="Sale not found")
     await session.delete(sale)
     await session.commit()
+    clear_cache(prefix="dashboard:")
     await broadcast_data_update()
     return {"status": "ok", "deleted": sale_id}
 
@@ -376,22 +332,11 @@ async def train_forecast(
     category: str = Query("All"),
     session: AsyncSession = Depends(get_session)
 ):
-    # First validate that we have enough data
     ts = await monthly_series(session, category)
-
     if len(ts) < 6:
-        raise HTTPException(
-            status_code=400,
-            detail="Not enough monthly data to train (need >=6 months).",
-        )
-
+        raise HTTPException(status_code=400, detail="Not enough monthly data to train (need >=6 months).")
     background_tasks.add_task(train_model_background, category)
-
-    return {
-        "status": "training_queued",
-        "category": category,
-        "message": "Model training started in background. WebSocket updates will be sent."
-    }
+    return {"status": "training_queued", "category": category}
 
 @app.get("/predict")
 async def predict(
@@ -402,8 +347,6 @@ async def predict(
     ts = await monthly_series(session, category)
     if ts.empty:
         raise HTTPException(status_code=404, detail="No data for requested category")
-
-    # Remove timezone information
     ts['ds'] = pd.to_datetime(ts['ds']).dt.tz_localize(None)
     ts = ts.dropna()
 
@@ -417,31 +360,52 @@ async def predict(
         model.fit(ts)
         joblib.dump(model, path)
 
-    # Forecast
     future = model.make_future_dataframe(periods=horizon, freq="MS")
     forecast = model.predict(future)
-
-    # Build output
     out = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
     actuals = ts.set_index("ds")["y"]
-
-    # Add actual values only where available
     out["actual"] = actuals.reindex(out["ds"]).values
-
-    # Replace NaNs for JSON safety and ensure no timezone in datetime
     out = out.replace({np.nan: None})
-    out["ds"] = pd.to_datetime(out["ds"]).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+    out["ds"] = pd.to_datetime(out["ds"]).dt.strftime("%Y-%m-%d")
 
-    return {
-        "category": category,
-        "horizon": horizon,
-        "series": out.to_dict(orient="records"),
-        "columns": ["ds", "actual", "yhat", "yhat_lower", "yhat_upper"]
-    }
+    return {"category": category, "horizon": horizon, "series": out.to_dict(orient="records")}
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "active_websocket_connections": len(manager.active_connections)
-    }
+    return {"status": "healthy", "active_websocket_connections": len(manager.active_connections)}
+
+# ---------------- Background Training ---------------- #
+async def train_model_background(category: str):
+    try:
+        await manager.broadcast({
+            "status": "training_started",
+            "category": category,
+            "message": f"Training started for {category}"
+        })
+        async with AsyncSessionLocal() as session:
+            ts = await monthly_series(session, category)
+            if ts.empty or len(ts) < 6:
+                await manager.broadcast({
+                    "status": "training_failed",
+                    "category": category,
+                    "error": "Not enough data"
+                })
+                return
+            ts['ds'] = pd.to_datetime(ts['ds']).dt.tz_localize(None)
+            ts = ts.dropna()
+            m = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False, uncertainty_samples=100)
+            m.fit(ts)
+            p = model_path_for(category)
+            joblib.dump(m, p)
+            await manager.broadcast({
+                "status": "training_completed",
+                "category": category,
+                "months_trained": len(ts)
+            })
+    except Exception as e:
+        logger.error(f"Background training failed: {e}")
+        await manager.broadcast({
+            "status": "training_failed",
+            "category": category,
+            "error": str(e)
+        })

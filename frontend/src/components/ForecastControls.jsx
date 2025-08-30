@@ -8,10 +8,10 @@ export default function ForecastControls({ category, setCategory, horizon, setHo
 
   useEffect(() => {
     setLoadingCats(true);
-    axios.get("http://127.0.0.1:8000/sales_by_category")
+    axios.get("http://127.0.0.1:8000/categories")
       .then(res => {
-        const cats = res.data.map(r => r.Product_Category);
-        setCategories(["All", ...cats]);
+        const cats = res.data.categories || [];
+        setCategories(cats);
       })
       .catch(err => {
         console.error("Failed to load categories:", err);
@@ -27,7 +27,6 @@ export default function ForecastControls({ category, setCategory, horizon, setHo
         `http://127.0.0.1:8000/train_forecast?category=${encodeURIComponent(category)}`
       );
 
-      // The actual status will come via WebSocket, but we can show immediate feedback
       setTrainStatus({
         loading: false,
         message: `Training queued for ${category}. Watch for WebSocket updates.`

@@ -1,48 +1,38 @@
-# load_data.py
 import pandas as pd
 import asyncio
 import math
 from datetime import datetime
-from database import engine, AsyncSessionLocal
+from database import AsyncSessionLocal
 from models import Sale
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete
+import asyncpg
 
 CSV_FILE = "./data/cleaned.csv"
 
+# -------------------- Safe converters -------------------- #
 def safe_string_convert(value, default="Unknown"):
-    """Safely convert value to string, handling nan values"""
     if pd.isna(value) or (isinstance(value, float) and math.isnan(value)) or value == "" or value is None:
         return default
     return str(value).strip()
 
 def safe_float_convert(value, default=0.0, required=False):
-    """Safely convert value to float, handling nan values"""
     if pd.isna(value) or (isinstance(value, float) and math.isnan(value)):
-        if required:
-            return None  # Will cause row to be skipped
-        return default
+        return None if required else default
     try:
         return float(value)
     except (ValueError, TypeError):
-        if required:
-            return None
-        return default
+        return None if required else default
 
 def safe_int_convert(value, default=0, required=False):
-    """Safely convert value to int, handling nan values"""
     if pd.isna(value) or (isinstance(value, float) and math.isnan(value)):
-        if required:
-            return None
-        return default
+        return None if required else default
     try:
-        return int(float(value))  # Convert to float first to handle decimal strings
+        return int(float(value))
     except (ValueError, TypeError):
-        if required:
-            return None
-        return default
+        return None if required else default
 
 def safe_datetime_convert(value, time_format=False):
-    """Safely convert value to datetime, handling nan values"""
     if pd.isna(value) or (isinstance(value, float) and math.isnan(value)):
         return None
     try:
@@ -53,12 +43,32 @@ def safe_datetime_convert(value, time_format=False):
     except (ValueError, TypeError):
         return None
 
+# -------------------- Helpers -------------------- #
+async def clear_sales_data(session: AsyncSession):
+    """Delete all rows from the Sale table"""
+    await session.execute(delete(Sale))
+    await session.commit()
+    print("🗑️ Cleared all existing sales data")
+
+async def notify_dashboard_refresh():
+    """Send a NOTIFY event to Postgres so WebSocket clients refresh"""
+    conn = await asyncpg.connect(
+        user="postgres",
+        password="Priyanshu123",
+        database="ecom",
+        host="localhost",
+        port=5432
+    )
+    await conn.execute("NOTIFY sales_changes, 'reload';")
+    await conn.close()
+    print("📢 Sent NOTIFY to refresh dashboard")
+
+# -------------------- Main loader -------------------- #
 async def load_csv_to_db():
     try:
         df = pd.read_csv(CSV_FILE)
         print(f"📊 Loaded CSV with {len(df)} rows")
-        
-        # Rename columns to match the database schema
+
         df.rename(columns={
             "Order_Date": "order_date",
             "Time": "time",
@@ -79,18 +89,15 @@ async def load_csv_to_db():
             "Sales_per_Unit": "sales_per_unit"
         }, inplace=True)
 
-        # Display column info for debugging
-        print("📋 CSV Columns:", df.columns.tolist())
-        print("🔍 Sample data types:")
-        print(df.dtypes.head(10))
-
         async with AsyncSessionLocal() as session:  # type: AsyncSession
+            # Step 1: Clear old data
+            await clear_sales_data(session)
+
             objs = []
             skipped_rows = 0
-            
+
             for idx, row in df.iterrows():
                 try:
-                    # Convert and validate required fields
                     order_date = safe_datetime_convert(row["order_date"])
                     customer_id = safe_int_convert(row["customer_id"], required=True)
                     sales_value = safe_float_convert(row["sales"], required=True)
@@ -99,15 +106,14 @@ async def load_csv_to_db():
                     profit_value = safe_float_convert(row["profit"], required=True)
                     shipping_cost_value = safe_float_convert(row["shipping_cost"], required=True)
                     sales_per_unit_value = safe_float_convert(row["sales_per_unit"], required=True)
-                    
-                    # Check if any required field is None (failed conversion)
+
                     if (order_date is None or customer_id is None or sales_value is None or 
                         quantity_value is None or discount_value is None or profit_value is None or 
                         shipping_cost_value is None or sales_per_unit_value is None):
                         print(f"⚠️  Skipping row {idx}: Missing required numeric data")
                         skipped_rows += 1
                         continue
-                    
+
                     sale = Sale(
                         order_date=order_date,
                         time=safe_datetime_convert(row["time"], time_format=True),
@@ -127,23 +133,20 @@ async def load_csv_to_db():
                         payment_method=safe_string_convert(row["payment_method"], "Unknown"),
                         sales_per_unit=sales_per_unit_value,
                     )
-                    
+
                     objs.append(sale)
-                    
-                    # Process in batches to avoid memory issues
+
                     if len(objs) >= 1000:
                         session.add_all(objs)
                         await session.commit()
                         print(f"✅ Processed batch: {len(objs)} rows")
                         objs = []
-                        
+
                 except Exception as e:
                     print(f"❌ Error processing row {idx}: {str(e)}")
-                    print(f"   Row data: {dict(row)}")
                     skipped_rows += 1
                     continue
 
-            # Insert remaining objects
             if objs:
                 session.add_all(objs)
                 await session.commit()
@@ -154,7 +157,10 @@ async def load_csv_to_db():
             print(f"   Total rows in CSV: {len(df)}")
             print(f"   Successfully inserted: {total_processed}")
             print(f"   Skipped rows: {skipped_rows}")
-            
+
+        # Step 2: Notify dashboard after reload
+        await notify_dashboard_refresh()
+
     except FileNotFoundError:
         print(f"❌ Error: CSV file '{CSV_FILE}' not found")
     except pd.errors.EmptyDataError:

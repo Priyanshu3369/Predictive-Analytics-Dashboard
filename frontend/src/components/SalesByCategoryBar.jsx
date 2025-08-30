@@ -1,60 +1,13 @@
-import React, { useEffect, useState } from "react";
-import axios from "axios";
+import React from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import ChartCard from "./ChartCard";
 
-export default function SalesByCategoryBar() {
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-
-  const fetchData = () => {
-    setLoading(true);
-    axios.get("http://127.0.0.1:8000/sales_by_category")
-      .then(res => {
-        const parsed = res.data.map(r => ({ ...r, Sales: Number(r.Sales) }));
-        setData(parsed);
-      })
-      .catch(err => setError(err.message || "Failed to load"))
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  // 🔥 Listen for live updates
-  useEffect(() => {
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "data_updated") {
-          fetchData();
-        }
-      } catch { }
-    };
-    return () => ws.close(1000, "unmount chart");
-  }, []);
-
-  if (loading) {
+export default function SalesByCategoryBar({ data }) {
+  if (!data || data.length === 0) {
     return (
       <ChartCard title="Sales by Product Category">
         <div className="flex items-center justify-center h-full">
-          <div className="text-gray-500">Loading…</div>
-        </div>
-      </ChartCard>
-    );
-  }
-
-  if (error) {
-    return (
-      <ChartCard title="Sales by Product Category">
-        <div className="flex items-center justify-center h-full">
-          <div className="text-red-500 text-center">
-            <div className="text-red-600 mb-2">⚠️ Error</div>
-            <div>{error}</div>
-          </div>
+          <div className="text-gray-500">No data available</div>
         </div>
       </ChartCard>
     );
@@ -91,7 +44,6 @@ export default function SalesByCategoryBar() {
               borderRadius: "8px",
               boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)"
             }}
-
           />
           <Legend wrapperStyle={{ paddingTop: "20px" }} />
           <Bar

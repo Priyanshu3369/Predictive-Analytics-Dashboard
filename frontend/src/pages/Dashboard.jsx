@@ -8,6 +8,9 @@ import ForecastChart from "../components/ForecastChart";
 
 export default function Dashboard() {
   const [summary, setSummary] = useState({});
+  const [salesByCategory, setSalesByCategory] = useState([]);
+  const [salesByGender, setSalesByGender] = useState([]);
+  const [paymentMethods, setPaymentMethods] = useState([]);
   const [timeseries, setTimeseries] = useState([]);
   const [category, setCategory] = useState("All");
   const [horizon, setHorizon] = useState(3);
@@ -16,17 +19,23 @@ export default function Dashboard() {
   const [forecastError, setForecastError] = useState(null);
   const [loadingSummary, setLoadingSummary] = useState(true);
   const [wsMessage, setWsMessage] = useState(null);
-  const [ws, setWs] = useState(null);
 
   // ---------------- FETCHERS ---------------- //
-  const fetchSummary = useCallback(async () => {
-    const [s, t] = await Promise.all([
-      axios.get("http://127.0.0.1:8000/summary"),
-      axios.get("http://127.0.0.1:8000/timeseries")
-    ]);
-    setSummary(s.data);
-    setTimeseries(t.data);
-  }, []);
+  const fetchDashboardData = useCallback(async () => {
+    try {
+      setLoadingSummary(true);
+      const res = await axios.get(`http://127.0.0.1:8000/dashboard_data?category=${encodeURIComponent(category)}`);
+      setSummary(res.data.summary);
+      setSalesByCategory(res.data.sales_by_category);
+      setSalesByGender(res.data.sales_by_gender);
+      setPaymentMethods(res.data.payment_methods);
+      setTimeseries(res.data.timeseries.data);
+    } catch (err) {
+      console.error("Dashboard data fetch failed:", err);
+    } finally {
+      setLoadingSummary(false);
+    }
+  }, [category]);
 
   const fetchForecast = useCallback(async (cat, hor) => {
     try {
@@ -49,106 +58,41 @@ export default function Dashboard() {
 
   // Initial load
   useEffect(() => {
-    setLoadingSummary(true);
-    fetchSummary()
-      .catch(console.error)
-      .finally(() => setLoadingSummary(false));
+    fetchDashboardData();
     fetchForecast(category, horizon);
-  }, [fetchSummary, fetchForecast, category, horizon]);
+  }, [fetchDashboardData, fetchForecast, category, horizon]);
 
-  // WebSocket connection + handlers
+  // WebSocket connection
   useEffect(() => {
-    let websocket = null;
-    let reconnectTimeout = null;
-
-    const connectWebSocket = () => {
+    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    ws.onmessage = (event) => {
       try {
-        websocket = new WebSocket("ws://127.0.0.1:8000/ws");
-
-        websocket.onopen = () => {
-          console.log("✅ WebSocket connected");
-          setWs(websocket);
-          // Optional: send a subscription; backend currently logs
-          websocket.send(JSON.stringify({ type: "subscribe", category: category }));
-        };
-
-        websocket.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            console.log("📩 WS Received:", data);
-
-            // Training messages (existing behavior)
-            if (data.status === "training_started") {
-              setWsMessage({ type: "info", message: `Training started for ${data.category}` });
-            } else if (data.status === "training_completed") {
-              setWsMessage({ type: "success", message: `Training completed for ${data.category} (${data.months_trained} months)` });
-              fetchForecast(category, horizon);
-            } else if (data.status === "training_failed") {
-              setWsMessage({ type: "error", message: `Training failed for ${data.category}: ${data.error}` });
-            }
-
-            // 🔥 NEW: data change broadcast
-            if (data.type === "data_updated") {
-              setWsMessage({ type: "info", message: data.message || "Data updated" });
-              // Re-fetch only what Dashboard owns
-              fetchSummary().catch(console.error);
-              // Forecast can stay as-is; retrain is separate
-            }
-
-            setTimeout(() => setWsMessage(null), 5000);
-          } catch (error) {
-            console.error("Error parsing WebSocket message:", error);
-          }
-        };
-
-        websocket.onclose = (event) => {
-          console.log("❌ WebSocket disconnected", event.code, event.reason);
-          setWs(null);
-          if (event.code !== 1000) {
-            reconnectTimeout = setTimeout(() => {
-              console.log("🔄 Attempting to reconnect WebSocket...");
-              connectWebSocket();
-            }, 3000);
-          }
-        };
-
-        websocket.onerror = (error) => {
-          console.error("WebSocket error:", error);
-        };
-
-      } catch (error) {
-        console.error("Failed to create WebSocket:", error);
-      }
+        const data = JSON.parse(event.data);
+        if (data.type === "data_updated") {
+          setWsMessage({ type: "info", message: data.message || "Data updated" });
+          fetchDashboardData();
+        }
+        if (data.status === "training_completed") {
+          setWsMessage({ type: "success", message: `Training completed for ${data.category}` });
+          fetchForecast(category, horizon);
+        }
+        if (data.status === "training_failed") {
+          setWsMessage({ type: "error", message: `Training failed: ${data.error}` });
+        }
+      } catch {}
     };
-
-    connectWebSocket();
-
-    return () => {
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (websocket) websocket.close(1000, "Component unmounting");
-    };
-  }, [category, horizon, fetchForecast, fetchSummary]);
+    return () => ws.close(1000, "unmount dashboard");
+  }, [fetchDashboardData, fetchForecast, category, horizon]);
 
   // ---------------- FORMATTERS ---------------- //
-  const formatCurrency = (value) => {
-    if (value == null) return "—";
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(value);
-  };
+  const formatCurrency = (value) => value == null ? "—" :
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value);
 
-  const formatNumber = (value) => {
-    if (value == null) return "—";
-    return new Intl.NumberFormat('en-US').format(value);
-  };
+  const formatNumber = (value) => value == null ? "—" :
+    new Intl.NumberFormat('en-US').format(value);
 
-  const formatPercent = (value) => {
-    if (value == null) return "—";
-    return `${(value * 100).toFixed(1)}%`;
-  };
+  const formatPercent = (value) => value == null ? "—" :
+    `${(value * 100).toFixed(1)}%`;
 
   const SummaryCard = ({ title, value, icon, color = "blue" }) => {
     const colorClasses = {
@@ -183,42 +127,9 @@ export default function Dashboard() {
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
       <div className="p-6">
         <div className="mb-8">
-          <h1 className="text-4xl font-bold text-gray-900 mb-2">
-            📊 Predictive Analytics Dashboard
-          </h1>
+          <h1 className="text-4xl font-bold text-gray-900 mb-2">📊 Predictive Analytics Dashboard</h1>
           <p className="text-gray-600">Monitor your business performance and forecast future trends</p>
         </div>
-
-        {/* WebSocket Notification */}
-        {wsMessage && (
-          <div className={`mb-6 p-4 rounded-lg border shadow-sm ${
-            wsMessage.type === "error"
-              ? "bg-red-100 border-red-300 text-red-800"
-              : wsMessage.type === "success"
-                ? "bg-green-100 border-green-300 text-green-800"
-                : "bg-blue-100 border-blue-300 text-blue-800"
-          }`}>
-            <div className="flex items-center">
-              <span className="mr-2 text-lg">
-                {wsMessage.type === "error" ? "❌" :
-                 wsMessage.type === "success" ? "✅" : "ℹ️"}
-              </span>
-              <div>
-                <strong className="block text-sm font-medium">
-                  {wsMessage.type === "error" ? "Error" :
-                   wsMessage.type === "success" ? "Success" : "Info"}
-                </strong>
-                <span className="text-sm">{wsMessage.message}</span>
-              </div>
-              <button
-                onClick={() => setWsMessage(null)}
-                className="ml-auto text-gray-500 hover:text-gray-700"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <SummaryCard title="Total Sales" value={formatCurrency(summary.total_sales)} icon="💰" color="green" />
@@ -229,11 +140,11 @@ export default function Dashboard() {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
           <div className="lg:col-span-2">
-            <SalesByCategoryBar />
+            <SalesByCategoryBar data={salesByCategory} />
           </div>
           <div className="flex flex-col gap-6">
-            <SalesByGenderPie />
-            <PaymentMethodPie />
+            <SalesByGenderPie data={salesByGender} />
+            <PaymentMethodPie data={paymentMethods} />
           </div>
         </div>
 
@@ -245,25 +156,11 @@ export default function Dashboard() {
             setHorizon={setHorizon}
             onTrain={handleAfterTrain}
           />
-
           <div>
             {loadingForecast ? (
-              <div className="p-8 bg-white rounded-xl shadow-md">
-                <div className="flex items-center justify-center space-x-3">
-                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-                  <span className="text-gray-600 text-lg">Loading forecast…</span>
-                </div>
-              </div>
+              <div className="p-8 bg-white rounded-xl shadow-md">Loading forecast…</div>
             ) : forecastError ? (
-              <div className="p-6 bg-white rounded-xl shadow-md border-l-4 border-red-500">
-                <div className="flex items-center space-x-3">
-                  <span className="text-red-600 text-2xl">⚠️</span>
-                  <div>
-                    <h3 className="text-lg font-semibold text-red-800">Forecast Error</h3>
-                    <p className="text-red-600 mt-1">{forecastError}</p>
-                  </div>
-                </div>
-              </div>
+              <div className="p-6 bg-white rounded-xl shadow-md border-l-4 border-red-500">{forecastError}</div>
             ) : (
               <ForecastChart data={forecastData} />
             )}
