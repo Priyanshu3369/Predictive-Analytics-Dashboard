@@ -23,7 +23,9 @@ from pydantic import BaseModel
 
 from database import AsyncSessionLocal, get_session
 from models import Sale
+from dotenv import load_dotenv
 
+load_dotenv()
 # --------------------------------------------------
 # Logging setup
 # --------------------------------------------------
@@ -147,11 +149,11 @@ async def notify_handler(conn, pid, channel, payload):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conn = await asyncpg.connect(
-        user="postgres",
-        password="Priyanshu123",
-        database="ecom",
-        host="localhost",
-        port=5432
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", 5432))
     )
     await conn.add_listener("sales_changes", notify_handler)
     logger.info("✅ Listening for Postgres NOTIFY events...")
